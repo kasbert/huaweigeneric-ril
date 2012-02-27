@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <dirent.h>
+
 #include <fcntl.h>
 #include <pthread.h>
 #include <alloca.h>
@@ -34,9 +36,11 @@
 #include <sys/socket.h>
 #include <cutils/sockets.h>
 #include <termios.h>
-#include <cutils/properties.h>
 
 #define LOG_NDEBUG 0
+#define LOG_NDDEBUG 0
+#define LOG_NIDEBUG 0
+
 #define LOG_TAG "RIL"
 #include <utils/Log.h>
 
@@ -44,6 +48,10 @@
 
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
 #define PPP_TTY_PATH "ppp0"
+
+#define SU_CMD "rild.su - "
+#define KILL_PPP_CMD SU_CMD "rild.killall pppd"
+#define TEST_PPP_CMD SU_CMD "rild.killall -0 pppd"
 
 #ifdef USE_TI_COMMANDS
 
@@ -77,8 +85,11 @@ static SIM_Status getSIMStatus();
 static int getCardStatus(RIL_CardStatus **pp_card_status);
 static void freeCardStatus(RIL_CardStatus *p_card_status);
 static void onDataCallListChanged(void *param);
+static int killPPP();
+static int isPPPRunning();
 static int killConn(char * cid);
-static int wait_for_property(const char *name, const char *desired_value, int maxwait);
+static char *getPPPDevice();
+
 
 extern const char * requestToString(int request);
 
@@ -106,7 +117,8 @@ static pthread_mutex_t s_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_state_cond = PTHREAD_COND_INITIALIZER;
 
 static int s_port = -1;
-static const char * s_device_path = NULL;
+static const char * s_device_path = NULL; // /dev/ttyUSB2
+static const char * s_ppp_device_name = NULL; // ttyUSB0
 static int          s_device_socket = 0;
 
 /* trigger change to this with s_state_cond */
@@ -399,7 +411,9 @@ static void onSIMReady()
 		 * ds = 1   // Status reports routed to TE
 		 * bfr = 1  // flush buffer
 		 */
-		at_send_command("AT+CNMI=1,2,2,1,1", NULL);
+		//at_send_command("AT+CNMI=1,2,2,1,1", NULL);
+		// bfr=0 flush to TE
+		at_send_command("AT+CNMI=1,2,2,1,0", NULL);
 
 		at_send_command("AT+CSCB=1", NULL);
 
@@ -615,11 +629,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 	}
 
     // make sure pppd is still running, invalidate datacall if it isn't
-	if ((fd = open("/sys/class/net/ppp0/ifindex",O_RDONLY)) > 0)
-    {
-		close(fd);
-    }
-	else
+	if (!isPPPRunning())
 	{
 		responses[0].active = 0;
 	}
@@ -1848,22 +1858,111 @@ error:
 
 static char userPassStatic[512] = "preload";
 
+static int killPPP() {
+    int ret = !system(KILL_PPP_CMD);
+    LOGD("killPPP %d", ret);
+    return ret;
+}
+
+static int isPPPRunning() {
+	// command returns 0 if pppd exists
+	int ret = !system(TEST_PPP_CMD);
+    LOGD("isPPPRunning %d", ret);
+    return ret;
+}
+
+static int startPPP(char *user, char *pass) {
+	//set up the pap/chap secrets file
+	char *pppDevice = getPPPDevice();
+	char userpass[512];
+	sprintf(userpass, "%s * %s", user, pass);
+	if (0 != strcmp(userpass, userPassStatic))
+	{
+		strcpy (userPassStatic, userpass);
+		int len = strlen(userpass);
+		int fd = open("/etc/ppp/pap-secrets",O_WRONLY);
+		if(fd < 0) {
+		  LOGE("Cannot write pap-secrets");
+		  goto error;
+		}
+		write(fd, userpass, len);
+		close(fd);
+		fd = open("/etc/ppp/chap-secrets",O_WRONLY);
+		if(fd < 0) {
+		  LOGE("Cannot write pap-secrets");
+		  goto error;
+		}
+		write(fd, userpass, len);
+		close(fd);
+
+#if 0
+		FILE *pppconfig;
+		char *buffer;
+		long buffSize;
+		pppconfig = fopen("/etc/ppp/options.huawei","r");
+		if(!pppconfig)
+			goto error;
+
+		//filesize
+		fseek(pppconfig, 0, SEEK_END);
+		buffSize = ftell(pppconfig);
+		rewind(pppconfig);
+
+		//allocate memory
+		buffer = (char *) malloc (sizeof(char)*buffSize);
+		if (buffer == NULL)
+			goto error;
+
+		//read in the original file
+		len = fread (buffer,1,buffSize,pppconfig);
+		if (len != buffSize) {
+			free(buffer);
+			goto error;
+		}
+		fclose(pppconfig);
+
+		char *optName;
+		asprintf(&optName, "/etc/ppp/options.%s", pppDevice);
+		pppconfig = fopen(optName,"w");
+		free(optName);
+		if (!pppconfig) {
+			free(buffer);
+			goto error;
+		}
+		fwrite(buffer,1,buffSize,pppconfig);
+		fprintf(pppconfig,"name %s\n",user);
+		fclose(pppconfig);
+		free(buffer);
+#endif
+	}
+
+
+	char *cmd;
+	int ret;
+	asprintf(&cmd, SU_CMD "pppd %s %s call %s", user ? "name" : "", user ? user : "", pppDevice);
+	ret = system(cmd);
+	LOGD("system: '%s' returned %d", cmd, ret);
+	free(cmd);
+	free(pppDevice);
+	return ret;
+
+	error:
+	free(pppDevice);
+	return -1;
+}
+
 static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 {
 	const char *apn;
 	char *user = NULL;
 	char *pass = NULL;
 	char *cmd;
-	char userpass[512];
 	int err;
 	ATResponse *p_response = NULL;
 	int fd, pppstatus,i;
-	FILE *pppconfig;
 	size_t cur = 0;
 	ssize_t written, rlen;
 	char status[32] = {0};
-	char *buffer;
-	long buffSize, len;
 	int retry = 10;
 //	char *response[3] = { "1", PPP_TTY_PATH, NULL};			// donut&eclair
 	char *response[2] = { "1", PPP_TTY_PATH};			// froyo
@@ -1907,7 +2006,6 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 		err = at_send_command("AT+CGACT=0,1", NULL);
 		// Start data on PDP context 1
 		err = at_send_command("ATD*99***1#", &p_response);
-		//err = at_send_command("ATD*99#", &p_response);			
 		if (err < 0 || p_response->success == 0) {
 			at_response_free(p_response);
 			goto error;
@@ -1926,58 +2024,19 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 		sleep(2); //Wait for the modem to finish
 	}
 
-	//set up the pap/chap secrets file
-	sprintf(userpass, "%s * %s", user, pass);
-	/*	
-	if (0)
-	//if (0 != strcmp(userpass, userPassStatic))
-	{
-		strcpy (userPassStatic, userpass);
-		len = strlen(userpass);
-		fd = open("/etc/ppp/pap-secrets",O_WRONLY);
-		if(fd < 0)
-			goto error;
-		write(fd, userpass, len);
-		close(fd);
-		fd = open("/etc/ppp/chap-secrets",O_WRONLY);
-		if(fd < 0)
-			goto error;
-		write(fd, userpass, len);
-		close(fd);
 
-		pppconfig = fopen("/etc/ppp/options.huawei","r");
-		if(!pppconfig)
-			goto error;
-
-		//filesize
-		fseek(pppconfig, 0, SEEK_END);
-		buffSize = ftell(pppconfig);
-		rewind(pppconfig);
-
-		//allocate memory
-		buffer = (char *) malloc (sizeof(char)*buffSize);
-		if (buffer == NULL)
-			goto error;
-
-		//read in the original file
-		len = fread (buffer,1,buffSize,pppconfig);
-		if (len != buffSize)
-			goto error;
-		fclose(pppconfig);
-
-		pppconfig = fopen("/system/etc/ppp/options.ttyUSB4","w");
-		fwrite(buffer,1,buffSize,pppconfig);
-		fprintf(pppconfig,"name %s\n",user);
-		fclose(pppconfig);
-		free(buffer);
-	}*/
-		
-	property_set("ctl.start", "pppd_gprs");
-	if (wait_for_property("init.svc.pppd_gprs", "running", 10) < 0) {
-        	goto error;
+	err = startPPP(user, pass);
+	if (err < 0) {
+		LOGE("system returned error");
+		killConn(cid);
+		goto error;
 	}
-	
-	sleep(2); // Allow time for ip-up to complete
+
+	sleep(4); // Allow time for ip-up to complete
+	if (!isPPPRunning()) {
+		LOGE("pppd is not running");
+		goto error;
+	}
 
 	RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
 	return;
@@ -1988,51 +2047,24 @@ error:
 
 }
 
-static int wait_for_property(const char *name, const char *desired_value, int maxwait)
-{
-    char value[PROPERTY_VALUE_MAX] = {'\0'};
-    int maxnaps = maxwait / 1;
-
-    if (maxnaps < 1) {
-        maxnaps = 1;
-    }
-
-    while (maxnaps-- > 0) {
-        usleep(1000000);
-        if (property_get(name, value, NULL)) {
-            if (desired_value == NULL || 
-                    strcmp(value, desired_value) == 0) {
-                return 0;
-            }
-        }
-    }
-    return -1; /* failure */
-}
-
 static int killConn(char * cid)
 {
 	int err;
 	char * cmd;
-	int fd;
 	int i=0;
 	ATResponse *p_response = NULL;
 
 	LOGD("killConn");
 
-   /* while ((fd = open("/sys/class/net/ppp0/ifindex",O_RDONLY)) > 0)
+    while (isPPPRunning())
     {
+    	LOGD("killall %d", i);
         if(i%5 == 0)
-            system("killall pppd");
+        	killPPP();
         if(i>25)
             goto error;
         i++;
-		close(fd);
         sleep(1);
-    }
-*/
-    property_set("ctl.stop", "pppd_gprs");
-    if (wait_for_property("init.svc.pppd_gprs", "stopped", 10) < 0) {
-        goto error;
     }
 
     LOGD("killall pppd finished");
@@ -2060,9 +2092,10 @@ static int killConn(char * cid)
                 at_response_free(p_response);
                 goto error;
             }
-        }    
+        }
+        //at_send_command("ATH", NULL);
     }
-	at_send_command("ATH", NULL);
+
 	return 0;
 
 error:
@@ -2072,10 +2105,10 @@ error:
 static void requestDeactivateDataCall(void *data, size_t datalen, RIL_Token t)
 {
 	char * cid;
-
-	LOGD("requestDeactivateDataCall()");
-
 	cid = ((char **)data)[0];
+
+	LOGD("requestDeactivateDataCall() %s", cid);
+
 	if (killConn(cid) < 0)
 		goto error;
 
@@ -3864,6 +3897,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
 		case RIL_REQUEST_SET_CLIR:
 			requestSetCLIR(data, datalen, t);
+			break;
 
 		case RIL_REQUEST_SEND_SMS_EXPECT_MORE:
 			requestSendSMSExpectMore(data, datalen, t);
@@ -3965,7 +3999,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
  * Synchronous call from the RIL to us to return current radio state.
  * RADIO_STATE_UNAVAILABLE should be the initial state.
  */
-static RIL_RadioState
+	static RIL_RadioState
 currentState()
 {
 	return sState;
@@ -3993,10 +4027,10 @@ static void onCancel (RIL_Token t)
 
 static const char * getVersion(void)
 {
-	return "HTC Vogue Community RIL 1.6.0";
+	return "Huawei generic RIL 1.6.1";
 }
 
-static void
+	static void
 setRadioState(RIL_RadioState newState)
 {
 	RIL_RadioState oldState;
@@ -4340,7 +4374,7 @@ static void initializeCallback(void *param)
 	at_send_command("AT+CLIR=0", NULL);
 
 	/*  bring up the device, also resets the stack. Don't do this! Handled elsewhere */
-	at_send_command("AT+CFUN=1", NULL);
+//	at_send_command("AT+CFUN=1", NULL);
 
 	if(isgsm) {
 		/*  Call Waiting notifications */
@@ -4525,10 +4559,75 @@ static void onATTimeout()
 	setRadioState (RADIO_STATE_UNAVAILABLE);
 }
 
+static int openControlDevice()
+{
+  int fd, i;
+  char * devName, *last = 0;
+  
+  if (!strstr (s_device_path, "%d")) {
+    fd = open (s_device_path, O_RDWR);
+    LOGD("Open %s fd %d", s_device_path, fd);
+    return fd;
+  }
+  
+  // Get last device
+  for (last = 0, i = 0; i < 5; i++) {
+    asprintf(&devName, s_device_path, i);
+    if (access(devName, W_OK) == 0) {
+      if (last) {
+	free(last);
+      }
+      last = devName;
+    } else {
+      free (devName);
+    }
+  }
+  if (!last) {
+    return -1;
+  }
+  fd = open (last, O_RDWR);
+  LOGD("Open %s fd %d", last, fd);
+  free(last);
+  return fd;
+}
+
+static char *getPPPDevice() {
+  int fd, i;
+  char * devName, *pppName = 0, *p = 0;
+  
+  if (strstr (s_device_path, "%d")) {
+    // Get 1st device
+    for (i = 0; i < 5; i++) {
+      asprintf(&devName, s_device_path, i);
+      if (access(devName, W_OK) == 0) {
+	p = strrchr(devName, '/');
+	if (p) {
+	  pppName = strdup(p+1);
+	} else {
+	  pppName = strdup(devName);
+	}
+	free(devName);
+	break;
+      }
+    }
+  }
+  if (!pppName) {
+    p = strrchr(s_device_path, '/');
+    if (p) {
+      pppName = strdup(p+1);
+    } else {
+      pppName = strdup(s_device_path);
+    }
+  }
+  LOGD("Using device %s for ppp", pppName);
+  return pppName;
+}
+
+
 static void usage(char *s)
 {
 #ifdef RIL_SHLIB
-	fprintf(stderr, "htcgeneric-ril requires: -p <tcp port> or -d /dev/tty_device\n");
+	fprintf(stderr, "huaweigeneric-ril requires: -p <tcp port> or -d /dev/tty_device\n");
 #else
 	fprintf(stderr, "usage: %s [-p <tcp port>] [-d /dev/tty_device]\n", s);
 	exit(-1);
@@ -4546,6 +4645,7 @@ mainLoop(void *param)
 	at_set_on_timeout(onATTimeout);
 
 	for (;;) {
+		killPPP();
 		fd = -1;
 		while  (fd < 0) {
 			if (s_port > 0) {
@@ -4555,7 +4655,7 @@ mainLoop(void *param)
 						ANDROID_SOCKET_NAMESPACE_FILESYSTEM,
 						SOCK_STREAM );
 			} else if (s_device_path != NULL) {
-				fd = open (s_device_path, O_RDWR);
+				fd = openControlDevice();
 				if ( fd >= 0 && !memcmp( s_device_path, "/dev/ttyUSB", 11 ) ) {
 
 					/* disable echo on serial ports */
@@ -4568,6 +4668,7 @@ mainLoop(void *param)
 
 			if (fd < 0) {
 				perror ("opening AT interface. retrying...");
+				LOGD ("Opening AT interface. retrying...");
 				sleep(10);
 				/* never returns */
 			}
@@ -4622,13 +4723,13 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 				break;
 
 			case 'd':
-				//s_device_path = "/dev/ttyUSB2";
-				s_device_path = optarg;
+				s_device_path = "/dev/ttyUSB2";
+				s_device_path   = optarg;
 				LOGI("Opening tty device %s\n", s_device_path);
 				break;
 
 			case 's':
-				s_device_path = optarg;
+				s_device_path   = optarg;
 				s_device_socket = 1;
 				LOGI("Opening socket %s\n", s_device_path);
 				break;
@@ -4668,7 +4769,7 @@ int main (int argc, char **argv)
 				break;
 
 			case 'd':
-				//s_device_path = "/dev/ttyUSB2";
+				s_device_path = "/dev/ttyUSB2";
 				s_device_path   = optarg;
 				LOGI("Opening tty device %s\n", s_device_path);
 				break;
