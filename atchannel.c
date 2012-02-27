@@ -30,6 +30,9 @@
 #include <unistd.h>
 
 #define LOG_NDEBUG 0
+#define LOG_NDDEBUG 0
+#define LOG_NIDEBUG 0
+
 #define LOG_TAG "AT"
 #include <utils/Log.h>
 
