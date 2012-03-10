@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <cutils/sockets.h>
 #include <termios.h>
+#include <cutils/properties.h>
 
 #define LOG_NDEBUG 0
 #define LOG_NDDEBUG 0
@@ -49,9 +50,14 @@
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
 #define PPP_TTY_PATH "ppp0"
 
+//#define PPP_SVC "pppd_gprs"
+
+#ifndef PPP_SVC
 #define SU_CMD "rild.su - "
 #define KILL_PPP_CMD SU_CMD "rild.killall pppd"
 #define TEST_PPP_CMD SU_CMD "rild.killall -0 pppd"
+#endif
+
 
 #ifdef USE_TI_COMMANDS
 
@@ -87,6 +93,7 @@ static void freeCardStatus(RIL_CardStatus *p_card_status);
 static void onDataCallListChanged(void *param);
 static int killPPP();
 static int isPPPRunning();
+static int wait_for_property(const char *name, const char *desired_value, int maxwait);
 static int killConn(char * cid);
 static char *getPPPDevice();
 
@@ -1859,14 +1866,34 @@ error:
 static char userPassStatic[512] = "preload";
 
 static int killPPP() {
+#ifdef PPP_SVC
+    property_set("ctl.stop", PPP_SVC);
+    int ret = !wait_for_property("init.svc." PPP_SVC, "stopped", 10);
+#else
     int ret = !system(KILL_PPP_CMD);
+#endif
     LOGD("killPPP %d", ret);
     return ret;
 }
 
 static int isPPPRunning() {
-	// command returns 0 if pppd exists
-	int ret = !system(TEST_PPP_CMD);
+#ifdef PPP_SVC
+    char value[PROPERTY_VALUE_MAX] = {'\0'};
+    int ret = 0;
+    //inf fd;
+    //if ((fd = open("/sys/class/net/ppp0/ifindex",O_RDONLY)) > 0) {
+    //close(fd);
+    //return 0;
+    //}
+    if (property_get("init.svc." PPP_SVC, value, NULL)) {
+	ret = !strcmp(value, "running");
+    } else {
+	ret = 0;
+    }
+#else
+    // command returns 0 if pppd exists
+    int ret = !system(TEST_PPP_CMD);
+#endif
     LOGD("isPPPRunning %d", ret);
     return ret;
 }
@@ -1936,12 +1963,16 @@ static int startPPP(char *user, char *pass) {
 #endif
 	}
 
-
 	char *cmd;
-	int ret;
+#ifdef PPP_SVC
+	asprintf(&cmd, PPP_SVC ":%s %s call %s", user ? "name" : "", user ? user : "", pppDevice);
+	property_set("ctl.start", PPP_SVC);
+	int ret = wait_for_property("init.svc." PPP_SVC, "running", 10);
+#else
 	asprintf(&cmd, SU_CMD "pppd %s %s call %s", user ? "name" : "", user ? user : "", pppDevice);
-	ret = system(cmd);
-	LOGD("system: '%s' returned %d", cmd, ret);
+	int ret = system(cmd);
+#endif
+	LOGD("ppp start: '%s' returned %d", cmd, ret);
 	free(cmd);
 	free(pppDevice);
 	return ret;
@@ -2047,6 +2078,27 @@ error:
 
 }
 
+static int wait_for_property(const char *name, const char *desired_value, int maxwait)
+{
+    char value[PROPERTY_VALUE_MAX] = {'\0'};
+    int maxnaps = maxwait / 1;
+
+    if (maxnaps < 1) {
+        maxnaps = 1;
+    }
+
+    while (maxnaps-- > 0) {
+        usleep(1000000);
+        if (property_get(name, value, NULL)) {
+            if (desired_value == NULL || 
+		strcmp(value, desired_value) == 0) {
+                return 0;
+            }
+        }
+    }
+    return -1; /* failure */
+}
+
 static int killConn(char * cid)
 {
 	int err;
@@ -2127,9 +2179,10 @@ static void requestSMSAcknowledge(void *data, size_t datalen, RIL_Token t)
 	ackSuccess = ((int *)data)[0];
 
 	if (ackSuccess == 1) {
-		err = at_send_command("AT+CNMA=1", NULL);
+	    err = at_send_command("AT+CNMA", NULL);
+	    //err = at_send_command("AT+CNMA=1", NULL);
 	} else if (ackSuccess == 0)  {
-		err = at_send_command("AT+CNMA=2", NULL);
+	    err = at_send_command("AT+CNMA=2", NULL);
 	} else {
 		LOGE("unsupported arg to RIL_REQUEST_SMS_ACKNOWLEDGE\n");
 		goto error;
@@ -4027,7 +4080,7 @@ static void onCancel (RIL_Token t)
 
 static const char * getVersion(void)
 {
-	return "Huawei generic RIL 1.6.1";
+	return "Huawei generic RIL 1.6.2";
 }
 
 	static void
